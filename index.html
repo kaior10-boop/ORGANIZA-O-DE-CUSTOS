@@ -225,7 +225,7 @@ function val(id){ const el=document.getElementById(id); return el? el.value.trim
 /* =====================================================================
    DB LAYER (IndexedDB)
 ===================================================================== */
-const DB_NAME='GiroDB', DB_VERSION=1; var _db=null;
+const DB_NAME='GiroDB', DB_VERSION=2; var _db=null;
 function openDB(){ return new Promise((resolve,reject)=>{
   if(_db){ resolve(_db); return; }
   if(!window.indexedDB){ reject(new Error('IndexedDB indisponível neste navegador/contexto.')); return; }
@@ -239,6 +239,8 @@ function openDB(){ return new Promise((resolve,reject)=>{
     if(!db.objectStoreNames.contains('cashTransactions')) db.createObjectStore('cashTransactions',{keyPath:'id'});
     if(!db.objectStoreNames.contains('settings')) db.createObjectStore('settings',{keyPath:'id'});
     if(!db.objectStoreNames.contains('counters')) db.createObjectStore('counters',{keyPath:'name'});
+    if(!db.objectStoreNames.contains('loans')) db.createObjectStore('loans',{keyPath:'id'});
+    if(!db.objectStoreNames.contains('loanPayments')) db.createObjectStore('loanPayments',{keyPath:'id'});
   };
   req.onsuccess=(e)=>{ _db=e.target.result; resolve(_db); };
   req.onerror=(e)=>reject(e.target.error);
@@ -256,7 +258,7 @@ async function nextId(prefix){ const cur=await storeGet('counters',prefix); cons
    storage for files opened directly from disk, without a real http/https origin).
    The app still works fully during the session; data just isn't saved automatically. */
 var IS_MEMORY_MODE=false;
-var MEM_DB={contacts:{},operations:{},installments:{},receipts:{},cashTransactions:{},settings:{},counters:{}};
+var MEM_DB={contacts:{},operations:{},installments:{},receipts:{},cashTransactions:{},settings:{},counters:{},loans:{},loanPayments:{}};
 function enableMemoryFallback(){
   IS_MEMORY_MODE=true;
   storeGetAll=function(name){ return Promise.resolve(Object.values(MEM_DB[name]||{})); };
@@ -288,21 +290,35 @@ async function getReceipts(){ return storeGetAll('receipts'); }
 async function addCashTx(data){ const id=await nextId('CX'); const now=new Date().toISOString(); const t=Object.assign({id,createdAt:now},data); await storePut('cashTransactions',t); return t; }
 async function getCashTx(){ return storeGetAll('cashTransactions'); }
 
+/* EMPRÉSTIMOS (open-ended loans with interest, no installments) */
+async function addLoan(data){ const id=await nextId('LOAN'); const now=new Date().toISOString();
+  const loan=Object.assign({id,createdAt:now,updatedAt:now},data); await storePut('loans',loan); return loan; }
+async function updateLoan(id,data){ const l=await storeGet('loans',id); const u=Object.assign({},l,data,{updatedAt:new Date().toISOString()}); await storePut('loans',u); return u; }
+async function deleteLoan(id){ await storeDelete('loans',id); const pays=await getLoanPayments(); for(const p of pays){ if(p.loanId===id) await storeDelete('loanPayments',p.id); } }
+async function getLoans(){ return storeGetAll('loans'); }
+
+async function addLoanPayment(data){ const id=await nextId('LPAY'); const now=new Date().toISOString(); const p=Object.assign({id,status:'ATIVO',createdAt:now},data); await storePut('loanPayments',p); return p; }
+async function updateLoanPayment(id,data){ const p=await storeGet('loanPayments',id); const u=Object.assign({},p,data); await storePut('loanPayments',u); return u; }
+async function deleteLoanPayment(id){ await storeDelete('loanPayments',id); }
+async function getLoanPayments(){ return storeGetAll('loanPayments'); }
+
 async function getSettings(){ let s=await storeGet('settings','settings'); if(!s){ s={id:'settings',paymentMethods:['PIX','Transferência','Dinheiro','Outro']}; await storePut('settings',s);} return s; }
 async function updateSettings(data){ const s=await getSettings(); const u=Object.assign({},s,data); await storePut('settings',u); return u; }
 
-async function exportAllData(){ const [contacts,operations,installments,receipts,cashTransactions,settings]=await Promise.all([getContacts(),getOperations(),getInstallments(),getReceipts(),getCashTx(),getSettings()]);
-  return {version:1,exportedAt:new Date().toISOString(),contacts,operations,installments,receipts,cashTransactions,settings}; }
+async function exportAllData(){ const [contacts,operations,installments,receipts,cashTransactions,settings,loans,loanPayments]=await Promise.all([getContacts(),getOperations(),getInstallments(),getReceipts(),getCashTx(),getSettings(),getLoans(),getLoanPayments()]);
+  return {version:2,exportedAt:new Date().toISOString(),contacts,operations,installments,receipts,cashTransactions,settings,loans,loanPayments}; }
 async function importAllData(data){
-  for(const n of ['contacts','operations','installments','receipts','cashTransactions']) await storeClear(n);
+  for(const n of ['contacts','operations','installments','receipts','cashTransactions','loans','loanPayments']) await storeClear(n);
   for(const c of (data.contacts||[])) await storePut('contacts',c);
   for(const o of (data.operations||[])) await storePut('operations',o);
   for(const i of (data.installments||[])) await storePut('installments',i);
   for(const r of (data.receipts||[])) await storePut('receipts',r);
   for(const c of (data.cashTransactions||[])) await storePut('cashTransactions',c);
+  for(const l of (data.loans||[])) await storePut('loans',l);
+  for(const p of (data.loanPayments||[])) await storePut('loanPayments',p);
   if(data.settings) await storePut('settings',Object.assign({id:'settings'},data.settings));
 }
-async function clearAllData(){ for(const n of ['contacts','operations','installments','receipts','cashTransactions','counters']) await storeClear(n); await storePut('settings',{id:'settings',paymentMethods:['PIX','Transferência','Dinheiro','Outro']}); }
+async function clearAllData(){ for(const n of ['contacts','operations','installments','receipts','cashTransactions','counters','loans','loanPayments']) await storeClear(n); await storePut('settings',{id:'settings',paymentMethods:['PIX','Transferência','Dinheiro','Outro']}); }
 
 /* =====================================================================
    TYPE META + FINANCIAL CALCS
@@ -316,7 +332,8 @@ const TYPE_META={
 const STATUS_META={
   ABERTA:{label:'Aberta',color:'steel'}, VENCE_HOJE:{label:'Vence hoje',color:'amber'}, PARCIAL:{label:'Parcial',color:'steel'},
   PAGA:{label:'Paga',color:'sage'}, ATRASADA:{label:'Atrasada',color:'brick'}, CANCELADA:{label:'Cancelada',color:'gray'},
-  ATIVA:{label:'Em andamento',color:'steel'}, QUITADA:{label:'Concluída',color:'sage'}
+  ATIVA:{label:'Em andamento',color:'steel'}, QUITADA:{label:'Concluída',color:'sage'},
+  ABERTO:{label:'Em aberto',color:'amber'}, QUITADO:{label:'Quitado',color:'sage'}
 };
 function badge(status,cls){ const m=STATUS_META[status]||{label:status,color:'gray'}; return '<span class="tbadge '+m.color+'"><span class="tdot"></span>'+m.label+'</span>'; }
 function typeBadge(type){ const m=TYPE_META[type]||{label:type,color:'gray'}; return '<span class="tbadge '+m.color+'"><span class="tdot"></span>'+m.label+'</span>'; }
@@ -344,21 +361,33 @@ function calcAllocatedCapital(op){ if(!op.receivableAmount) return 0; const rati
 function calcExpectedProfit(ops){ return ops.filter(o=>o.status!=='CANCELADA').reduce((a,o)=>a+(o.receivableAmount-o.investedAmount),0); }
 function calcReceivedTotal(receipts){ return receipts.filter(r=>r.status==='ATIVO').reduce((a,r)=>a+r.amount,0); }
 
+/* Empréstimos (juros simples, sem parcelas, dívida em aberto até quitar) */
+function calcLoanInterestAmount(loan){ return Math.round(loan.principalAmount*((loan.interestRate||0)/100)*100)/100; }
+function calcLoanTotalAmount(loan){ return Math.round((loan.principalAmount+calcLoanInterestAmount(loan))*100)/100; }
+function calcLoanTotalReceived(loan,loanPayments){ return loanPayments.filter(p=>p.loanId===loan.id && p.status==='ATIVO').reduce((a,p)=>a+p.amount,0); }
+function calcLoanStatus(loan){ if(loan.totalReceived<=0.005) return 'ABERTO'; if(loan.totalReceived>=loan.totalAmount-0.005) return 'QUITADO'; return 'PARCIAL'; }
+function calcLoanPrincipalRecovered(loan){ return Math.min(loan.totalReceived,loan.principalAmount); }
+function calcLoanInterestReceived(loan){ return Math.max(0, Math.min(loan.totalReceived,loan.totalAmount) - loan.principalAmount); }
+
 /* =====================================================================
    GLOBAL STATE
 ===================================================================== */
-var DATA={contacts:[],operations:[],installments:[],receipts:[],cashTransactions:[],settings:null};
+var DATA={contacts:[],operations:[],installments:[],receipts:[],cashTransactions:[],settings:null,loans:[],loanPayments:[]};
 async function reloadData(){
-  const [contacts,operations,installments,receipts,cashTransactions,settings]=await Promise.all([getContacts(),getOperations(),getInstallments(),getReceipts(),getCashTx(),getSettings()]);
+  const [contacts,operations,installments,receipts,cashTransactions,settings,loans,loanPayments]=await Promise.all([getContacts(),getOperations(),getInstallments(),getReceipts(),getCashTx(),getSettings(),getLoans(),getLoanPayments()]);
   installments.forEach(i=>i.status=calcInstallmentStatus(i));
   operations.forEach(o=>{ o.outstandingBalance=calcOutstandingBalance(o,installments); o.totalReceived=o.receivableAmount-o.outstandingBalance; o.status=o.status==='CANCELADA'?'CANCELADA':calcOperationStatus(o,installments); });
-  DATA={contacts,operations,installments,receipts,cashTransactions,settings};
+  loans.forEach(l=>{ l.interestAmount=calcLoanInterestAmount(l); l.totalAmount=calcLoanTotalAmount(l); l.totalReceived=calcLoanTotalReceived(l,loanPayments); l.outstandingBalance=Math.max(0,Math.round((l.totalAmount-l.totalReceived)*100)/100); l.status=calcLoanStatus(l); l.principalRecovered=calcLoanPrincipalRecovered(l); l.interestReceived=calcLoanInterestReceived(l); });
+  DATA={contacts,operations,installments,receipts,cashTransactions,settings,loans,loanPayments};
   return DATA;
 }
 function contactById(id){ return DATA.contacts.find(c=>c.id===id); }
 function opById(id){ return DATA.operations.find(o=>o.id===id); }
 function installmentsOfOp(id){ return DATA.installments.filter(i=>i.operationId===id).sort((a,b)=>a.number-b.number); }
 function opsOfContact(id){ return DATA.operations.filter(o=>o.contactId===id); }
+function loanById(id){ return DATA.loans.find(l=>l.id===id); }
+function loanPaymentsOfLoan(id){ return DATA.loanPayments.filter(p=>p.loanId===id && p.status==='ATIVO').sort((a,b)=>b.date<a.date?-1:1); }
+function loansOfContact(id){ return DATA.loans.filter(l=>l.contactId===id); }
 
 /* =====================================================================
    ICONS
@@ -382,7 +411,8 @@ function ic(name){
     receipt:'<rect x="4" y="2" width="16" height="20" rx="2"/><path d="M8 7h8M8 11h8M8 15h5"/>',
     alert:'<path d="M12 3l10 18H2z"/><path d="M12 10v4M12 17h.01"/>',
     check:'<path d="M20 6L9 17l-5-5"/>',
-    inbox:'<path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.45 5.11L2 12v6a2 2 0 002 2h16a2 2 0 002-2v-6l-3.45-6.89A2 2 0 0016.76 4H7.24a2 2 0 00-1.79 1.11z"/>'
+    inbox:'<path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.45 5.11L2 12v6a2 2 0 002 2h16a2 2 0 002-2v-6l-3.45-6.89A2 2 0 0016.76 4H7.24a2 2 0 00-1.79 1.11z"/>',
+    money:'<circle cx="12" cy="12" r="9"/><path d="M12 6.5v11"/><path d="M9 9c0-1.2 1.3-2.2 3-2.2s3 .8 3 2c0 2.6-6 1.8-6 4.4 0 1.2 1.3 2.2 3 2.2s3-1 3-2.2"/>'
   };
   return '<svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'+M[name]+'</svg>';
 }
@@ -402,7 +432,7 @@ function renderTabbar(activeRoot){
     const isActive = t[0]==='#/'? activeRoot==='' : activeRoot===t[0].split('/')[1];
     return '<button class="tabbtn '+(isActive?'active':'')+'" onclick="go(\''+t[0]+'\')">'+ic(t[2])+'<span>'+t[1]+'</span></button>';
   }).join('');
-  document.getElementById('fabBtn').style.display = (activeRoot==='vencimentos'||activeRoot==='mais')? 'none':'flex';
+  document.getElementById('fabBtn').style.display = (activeRoot==='vencimentos'||activeRoot==='mais'||activeRoot==='emprestimos')? 'none':'flex';
 }
 
 function computeAlerts(){
@@ -427,6 +457,8 @@ async function renderApp(){
   else if(root==='caixa') html=pageCaixa();
   else if(root==='contatos' && parts[1]) html=pageContactDetail(parts[1]);
   else if(root==='contatos') html=pageContatos();
+  else if(root==='emprestimos' && parts[1]) html=pageLoanDetail(parts[1]);
+  else if(root==='emprestimos') html=pageEmprestimos();
   else if(root==='relatorios') html=pageRelatorios();
   else if(root==='backup') html=pageBackup();
   else if(root==='mais') html=pageMais();
@@ -472,6 +504,12 @@ function pageDashboard(){
   const emAtraso=calcOverdueAmount(DATA.installments);
   const lucroPrevisto=calcExpectedProfit(DATA.operations);
 
+  const loansActive=DATA.loans;
+  const loanCapital=loansActive.reduce((a,l)=>a+l.principalAmount,0);
+  const loanAReceber=loansActive.reduce((a,l)=>a+l.outstandingBalance,0);
+  const loanRecebido=loansActive.reduce((a,l)=>a+l.totalReceived,0);
+  const loanJuros=loansActive.reduce((a,l)=>a+l.interestAmount,0);
+
   const alerts=computeAlerts();
   const alertHtml=alerts.length? alerts.map(a=>'<div class="alert-row '+a.level+'"><span class="adot"></span><span>'+a.text+'</span></div>').join('') : '';
 
@@ -501,6 +539,9 @@ function pageDashboard(){
     +'<div class="stat-chip brass"><div class="slabel">Lucro previsto</div><div class="sval">'+money(lucroPrevisto)+'</div></div>'
   +'</div>'
   +(alerts.length? '<div class="section"><div class="section-head"><h3>Alertas</h3></div>'+alertHtml+'</div>':'')
+  +(loansActive.length? '<div class="section"><div class="section-head"><h3>💰 Empréstimos</h3><a onclick="go(\'#/emprestimos\')">Ver todos →</a></div>'
+    +'<div class="kpi-mini"><div class="kpi-box"><div class="klabel">Capital emprestado</div><div class="kval">'+money(loanCapital)+'</div></div><div class="kpi-box"><div class="klabel">A receber</div><div class="kval" style="color:var(--steel);">'+money(loanAReceber)+'</div></div></div>'
+    +'<div class="kpi-mini"><div class="kpi-box"><div class="klabel">Recebido</div><div class="kval" style="color:var(--sage);">'+money(loanRecebido)+'</div></div><div class="kpi-box"><div class="klabel">Juros previstos</div><div class="kval" style="color:var(--brass);">'+money(loanJuros)+'</div></div></div></div>':'')
   +'<div class="section"><div class="section-head"><h3>Capital alocado por tipo</h3></div><div class="ledger" style="padding:16px;"><div class="bar-chart">'+barsHtml+'</div></div></div>'
   +'<div class="section"><div class="section-head"><h3>Próximos vencimentos</h3><a onclick="go(\'#/vencimentos\')">Ver todos</a></div>'+upcomingHtml+'</div>';
 }
@@ -746,6 +787,196 @@ async function saveCashForm(){
 }
 
 /* =====================================================================
+   EMPRÉSTIMOS (dívida em aberto, juros simples, sem parcelas)
+===================================================================== */
+var LOAN_SEARCH=''; var LOAN_FILTER='';
+function pageEmprestimos(){
+  const capitalEmprestado=DATA.loans.reduce((a,l)=>a+l.principalAmount,0);
+  const totalContratado=DATA.loans.reduce((a,l)=>a+l.totalAmount,0);
+  const totalRecebido=DATA.loans.reduce((a,l)=>a+l.totalReceived,0);
+  const totalAReceber=Math.max(0,totalContratado-totalRecebido);
+  const jurosPrevistos=DATA.loans.reduce((a,l)=>a+l.interestAmount,0);
+  const lucroRecebido=DATA.loans.reduce((a,l)=>a+l.interestReceived,0);
+
+  let list=DATA.loans.slice();
+  if(LOAN_SEARCH) list=list.filter(l=>{ const c=contactById(l.contactId); return c && c.name.toLowerCase().indexOf(LOAN_SEARCH.toLowerCase())>-1; });
+  if(LOAN_FILTER) list=list.filter(l=>l.status===LOAN_FILTER);
+  list.sort((a,b)=>b.createdAt<a.createdAt?-1:1);
+  const filters=[['','Todos'],['ABERTO','Em aberto'],['PARCIAL','Parcial'],['QUITADO','Quitados']];
+  const rows=list.map(l=>{ const c=contactById(l.contactId);
+    return '<div class="ledger-row" onclick="go(\'#/emprestimos/'+l.id+'\')" style="cursor:pointer;">'
+    +'<div class="avatar">'+initials(c?c.name:'?')+'</div>'
+    +'<div class="lr-main"><div class="lr-name">'+escapeHtml(c?c.name:'—')+'</div><div class="lr-sub"><span>juros '+l.interestRate+'%</span>'+badge(l.status)+'</div></div>'
+    +'<div class="lr-right"><div class="lr-amt">'+money(l.outstandingBalance)+'</div><div class="lr-date">de '+money(l.totalAmount)+'</div></div></div>'; }).join('');
+
+  return '<div class="topbar"><div><div class="greet">💰 Empréstimos</div><div class="date">'+DATA.loans.length+' no total</div></div></div>'
+  +'<div class="stat-strip">'
+    +'<div class="stat-chip steel"><div class="slabel">Capital emprestado</div><div class="sval">'+money(capitalEmprestado)+'</div></div>'
+    +'<div class="stat-chip steel"><div class="slabel">Total contratado</div><div class="sval">'+money(totalContratado)+'</div></div>'
+    +'<div class="stat-chip sage"><div class="slabel">Total recebido</div><div class="sval">'+money(totalRecebido)+'</div></div>'
+    +'<div class="stat-chip steel"><div class="slabel">Total a receber</div><div class="sval">'+money(totalAReceber)+'</div></div>'
+    +'<div class="stat-chip brass"><div class="slabel">Juros previstos</div><div class="sval">'+money(jurosPrevistos)+'</div></div>'
+    +'<div class="stat-chip sage"><div class="slabel">Lucro recebido</div><div class="sval">'+money(lucroRecebido)+'</div></div>'
+  +'</div>'
+  +'<div class="page-pad" style="margin-bottom:12px;">'
+    +'<input placeholder="🔎 Buscar cliente..." value="'+escapeHtml(LOAN_SEARCH)+'" oninput="LOAN_SEARCH=this.value;refreshPage()" style="margin-bottom:10px;">'
+    +'<div class="chip-row" style="margin-bottom:10px;">'+filters.map(f=>'<button class="chip '+(LOAN_FILTER===f[0]?'active':'')+'" onclick="LOAN_FILTER=\''+f[0]+'\';refreshPage()">'+f[1]+'</button>').join('')+'</div>'
+    +'<button class="btn primary block" onclick="openLoanModal()">'+ic('plus')+' Novo empréstimo</button>'
+  +'</div>'
+  +'<div class="section">'+(list.length? '<div class="ledger">'+rows+'</div>' : '<div class="empty">'+ic('money')+'<h4>Nenhum empréstimo</h4><p>Toque em "Novo empréstimo" para começar.</p></div>')+'</div>';
+}
+
+function openLoanModal(id,fixedContactId){
+  const l=id? loanById(id): null;
+  const contactOptions=DATA.contacts.map(c=>'<option value="'+c.id+'" '+((l&&l.contactId===c.id)||(!l&&fixedContactId===c.id)?'selected':'')+'>'+escapeHtml(c.name)+'</option>').join('');
+  const principal=l?l.principalAmount:''; const rate=l?l.interestRate:''; const date=l?l.loanDate:todayISO(); const notes=l?(l.notes||''):'';
+  const hasPayments = l? loanPaymentsOfLoan(l.id).length>0: false;
+  showModal('<div class="modal-head"><h3>'+(id?'Editar empréstimo':'Novo empréstimo')+'</h3><button class="modal-close" onclick="closeModal()">&times;</button></div>'
+  +(hasPayments? '<div class="alert-row amber" style="margin-bottom:14px;"><span class="adot"></span><span style="font-size:12px;">Este empréstimo já tem pagamentos registrados. Alterar valor ou juros vai recalcular o saldo.</span></div>':'')
+  +'<div class="field"><label>Cliente <span class="req">*</span></label><div style="display:flex;gap:8px;"><select id="lf_contact" style="flex:1;">'+(fixedContactId||l?'':'<option value="">Selecione...</option>')+contactOptions+'</select>'+(l?'':'<button class="btn sm" onclick="quickAddContactLoan()">+ Novo</button>')+'</div></div>'
+  +'<div class="form-row2">'
+    +'<div class="field"><label>Valor emprestado <span class="req">*</span></label><input type="number" step="0.01" id="lf_principal" value="'+principal+'" oninput="updateLoanPreview()"></div>'
+    +'<div class="field"><label>Juros (%) <span class="req">*</span></label><input type="number" step="0.01" id="lf_rate" value="'+rate+'" oninput="updateLoanPreview()"></div>'
+  +'</div>'
+  +'<div class="field"><label>Data do empréstimo</label><input type="date" id="lf_date" value="'+date+'"></div>'
+  +'<div class="field"><label>Observação</label><textarea id="lf_notes" rows="2">'+escapeHtml(notes)+'</textarea></div>'
+  +'<div id="lf_preview" class="card" style="background:var(--surface2);border:1px solid var(--line);border-radius:var(--r-md);padding:14px;margin-bottom:16px;"></div>'
+  +'<button class="btn primary block" onclick="saveLoanForm('+(id?'\''+id+'\'':'null')+')">'+(id?'Salvar alterações':'Salvar empréstimo')+'</button>');
+  updateLoanPreview();
+}
+function updateLoanPreview(){
+  const principal=parseFloat(document.getElementById('lf_principal').value)||0;
+  const rate=parseFloat(document.getElementById('lf_rate').value)||0;
+  const interest=Math.round(principal*(rate/100)*100)/100; const total=Math.round((principal+interest)*100)/100;
+  document.getElementById('lf_preview').innerHTML=
+    '<div style="display:flex;justify-content:space-between;font-size:13px;padding:4px 0;"><span style="color:var(--ink-dim);">Valor emprestado</span><span class="mono">'+money(principal)+'</span></div>'
+    +'<div style="display:flex;justify-content:space-between;font-size:13px;padding:4px 0;"><span style="color:var(--ink-dim);">Juros ('+rate+'%)</span><span class="mono">'+money(interest)+'</span></div>'
+    +'<div style="display:flex;justify-content:space-between;font-size:14px;padding:8px 0 0;border-top:1px solid var(--line);margin-top:4px;"><span style="font-weight:700;">Total a receber</span><span class="mono" style="font-weight:700;color:var(--brass);">'+money(total)+'</span></div>';
+}
+async function quickAddContactLoan(){
+  const name=prompt('Nome do cliente:'); if(!name) return;
+  const c=await addContact({name:name.trim(),phone:''}); await reloadData();
+  const sel=document.getElementById('lf_contact'); sel.innerHTML=DATA.contacts.map(x=>'<option value="'+x.id+'">'+escapeHtml(x.name)+'</option>').join(''); sel.value=c.id;
+}
+async function saveLoanForm(id){
+  const contactId=document.getElementById('lf_contact').value;
+  const principal=parseFloat(document.getElementById('lf_principal').value)||0;
+  const rate=parseFloat(document.getElementById('lf_rate').value)||0;
+  const date=val('lf_date'); const notes=val('lf_notes');
+  if(!contactId){ toast('Selecione um cliente.','error'); return; }
+  if(principal<=0){ toast('Informe um valor emprestado maior que zero.','error'); return; }
+  if(rate<0){ toast('Os juros não podem ser negativos.','error'); return; }
+  if(!date){ toast('Informe a data do empréstimo.','error'); return; }
+  try{
+    if(id){
+      const existing=loanById(id); const hadPayments=loanPaymentsOfLoan(id).length>0;
+      if(hadPayments && (existing.principalAmount!==principal || existing.interestRate!==rate)){
+        const ok=await confirmDialog('Alterar valores','Este empréstimo já possui pagamentos registrados. Alterar o valor ou os juros modificará o saldo atual. Deseja continuar?');
+        if(!ok) return;
+      }
+      await updateLoan(id,{contactId,principalAmount:principal,interestRate:rate,loanDate:date,notes});
+      closeModal(); await reloadData(); renderApp(); toast('Empréstimo atualizado.');
+    } else {
+      const loan=await addLoan({contactId,principalAmount:principal,interestRate:rate,loanDate:date,notes});
+      await addCashTx({type:'SAIDA',category:'Empréstimo concedido',amount:principal,date,description:'Empréstimo concedido — '+loan.id,relatedLoanId:loan.id});
+      closeModal(); await reloadData(); go('#/emprestimos/'+loan.id); toast('Empréstimo registrado.');
+    }
+  }catch(e){ toast('Erro: '+e.message,'error'); }
+}
+async function handleDeleteLoan(id){
+  const hasPayments=loanPaymentsOfLoan(id).length>0;
+  const msg=hasPayments? 'Este empréstimo possui pagamentos registrados. A exclusão removerá também o histórico de pagamentos. Deseja continuar?' : 'Excluir este empréstimo?';
+  const ok=await confirmDialog('Excluir empréstimo',msg); if(!ok) return;
+  await deleteLoan(id); await reloadData(); go('#/emprestimos'); toast('Empréstimo excluído.');
+}
+
+function pageLoanDetail(id){
+  const l=loanById(id); if(!l) return '<div class="page-pad"><div class="empty"><h4>Empréstimo não encontrado</h4></div></div>';
+  const c=contactById(l.contactId);
+  const pays=loanPaymentsOfLoan(id);
+  const pct=l.totalAmount? Math.min(100,Math.round((l.totalReceived/l.totalAmount)*100)):0;
+  const rows=pays.map(p=>'<div class="ledger-row"><div class="lr-main"><div class="lr-name">'+formatDateBR(p.date)+'</div><div class="lr-sub"><span>'+escapeHtml(p.method)+'</span>'+(p.notes?'<span>· '+escapeHtml(p.notes)+'</span>':'')+'</div></div>'
+    +'<div class="lr-right"><div class="lr-amt" style="color:var(--sage);">+'+money(p.amount)+'</div><div style="display:flex;gap:4px;margin-top:4px;"><button class="btn sm ghost" onclick="openLoanPaymentModal(\''+l.id+'\',\''+p.id+'\')">'+ic('edit')+'</button><button class="btn sm ghost" onclick="handleDeleteLoanPayment(\''+p.id+'\',\''+l.id+'\')">'+ic('trash')+'</button></div></div></div>').join('');
+  return '<div class="topbar"><button class="backbtn" onclick="go(\'#/emprestimos\')">'+ic('back')+' Empréstimos</button></div>'
+  +'<div class="page-pad">'
+  +'<div style="display:flex;align-items:center;gap:12px;margin:6px 0 4px;"><div class="avatar" style="width:48px;height:48px;font-size:16px;">'+initials(c?c.name:'?')+'</div>'
+    +'<div><h1 style="font-family:var(--font-display);font-size:19px;">'+escapeHtml(c?c.name:'—')+'</h1><div style="margin-top:4px;">'+badge(l.status)+'</div></div></div>'
+  +'<div class="kpi-mini" style="margin-top:14px;">'
+    +'<div class="kpi-box"><div class="klabel">Valor emprestado</div><div class="kval">'+money(l.principalAmount)+'</div></div>'
+    +'<div class="kpi-box"><div class="klabel">Juros ('+l.interestRate+'%)</div><div class="kval" style="color:var(--brass);">'+money(l.interestAmount)+'</div></div>'
+    +'<div class="kpi-box"><div class="klabel">Total contratado</div><div class="kval">'+money(l.totalAmount)+'</div></div>'
+    +'<div class="kpi-box"><div class="klabel">Recebido</div><div class="kval" style="color:var(--sage);">'+money(l.totalReceived)+'</div><div class="progress"><div style="width:'+pct+'%"></div></div></div>'
+  +'</div>'
+  +'<div class="kpi-mini"><div class="kpi-box" style="grid-column:1/-1;"><div class="klabel">Saldo restante</div><div class="kval" style="font-size:20px;color:'+(l.status==='QUITADO'?'var(--sage)':'var(--steel)')+';">'+money(l.outstandingBalance)+'</div></div></div>'
+  +(l.notes? '<div style="font-size:12.5px;color:var(--ink-dim);margin-bottom:14px;">'+escapeHtml(l.notes)+'</div>':'')
+  +'<div style="display:flex;gap:10px;margin-bottom:18px;">'+(l.status!=='QUITADO'? '<button class="btn primary" style="flex:1;" onclick="openLoanPaymentModal(\''+l.id+'\')">'+ic('plus')+' Registrar pagamento</button>':'<div class="alert-row sage" style="flex:1;margin-bottom:0;"><span class="adot"></span><span>Empréstimo quitado</span></div>')+'<button class="btn" onclick="openLoanModal(\''+l.id+'\')">'+ic('edit')+'</button></div>'
+  +'<div class="section-head"><h3>Histórico de pagamentos ('+pays.length+')</h3></div>'
+  +(pays.length? '<div class="ledger" style="margin-bottom:16px;">'+rows+'</div>':'<div class="empty" style="padding:24px;">Nenhum pagamento registrado ainda.</div>')
+  +'<button class="btn danger block" onclick="handleDeleteLoan(\''+l.id+'\')">Excluir empréstimo</button>'
+  +'</div>';
+}
+
+function openLoanPaymentModal(loanId,paymentId){
+  const l=loanById(loanId); if(!l) return;
+  const p=paymentId? DATA.loanPayments.find(x=>x.id===paymentId): null;
+  const methods=(DATA.settings&&DATA.settings.paymentMethods)||['PIX','Transferência','Dinheiro','Outro'];
+  showModal('<div class="modal-head"><h3>'+(p?'Editar pagamento':'Registrar pagamento')+'</h3><button class="modal-close" onclick="closeModal()">&times;</button></div>'
+  +'<div style="font-size:12.5px;color:var(--ink-dim);margin-bottom:14px;">Saldo restante: <span class="mono" style="color:var(--ink);font-weight:700;">'+money(l.outstandingBalance+(p?p.amount:0))+'</span></div>'
+  +'<div class="form-row2">'
+    +'<div class="field"><label>Data</label><input type="date" id="lpf_date" value="'+(p?p.date:todayISO())+'"></div>'
+    +'<div class="field"><label>Valor recebido <span class="req">*</span></label><input type="number" step="0.01" id="lpf_amount" value="'+(p?p.amount:'')+'"></div>'
+  +'</div>'
+  +'<div class="field"><label>Forma de pagamento</label><select id="lpf_method">'+methods.map(m=>'<option value="'+m+'" '+(p&&p.method===m?'selected':'')+'>'+m+'</option>').join('')+'</select></div>'
+  +'<div class="field"><label>Observação</label><input id="lpf_notes" value="'+escapeHtml(p?(p.notes||''):'')+'"></div>'
+  +'<button class="btn primary block" onclick="saveLoanPaymentForm(\''+loanId+'\''+(p?',\''+p.id+'\'':',null')+')">Confirmar</button>');
+}
+async function saveLoanPaymentForm(loanId,paymentId){
+  const l=loanById(loanId);
+  const date=val('lpf_date'); const amount=parseFloat(document.getElementById('lpf_amount').value)||0;
+  const method=document.getElementById('lpf_method').value; const notes=val('lpf_notes');
+  if(amount<=0){ toast('Informe um valor recebido maior que zero.','error'); return; }
+  const saldoDisponivel = l.outstandingBalance + (paymentId? (DATA.loanPayments.find(p=>p.id===paymentId)||{amount:0}).amount : 0);
+  if(amount>saldoDisponivel+0.005){
+    showLoanOverpayConfirm(loanId,paymentId,date,method,notes,saldoDisponivel);
+    return;
+  }
+  await commitLoanPayment(loanId,paymentId,{date,amount,method,notes});
+}
+function showLoanOverpayConfirm(loanId,paymentId,date,method,notes,saldoDisponivel){
+  const box=document.getElementById('confirmBox');
+  box.innerHTML='<h3 style="font-size:15.5px;margin-bottom:10px;font-family:var(--font-display);">Valor maior que o saldo</h3>'
+    +'<p class="confirm-msg">Esse pagamento é maior que o saldo restante ('+money(saldoDisponivel)+'). O que deseja fazer?</p>'
+    +'<div style="display:flex;flex-direction:column;gap:10px;"><button class="btn primary block" id="lpOverCap">Registrar apenas o saldo ('+money(saldoDisponivel)+')</button><button class="btn block" id="lpOverCancel">Cancelar</button></div>';
+  document.getElementById('confirmOverlay').classList.add('show');
+  document.getElementById('lpOverCancel').onclick=()=>{ document.getElementById('confirmOverlay').classList.remove('show'); };
+  document.getElementById('lpOverCap').onclick=async()=>{ document.getElementById('confirmOverlay').classList.remove('show'); await commitLoanPayment(loanId,paymentId,{date,amount:saldoDisponivel,method,notes}); };
+}
+async function commitLoanPayment(loanId,paymentId,data){
+  try{
+    const l=loanById(loanId);
+    if(paymentId){
+      const old=DATA.loanPayments.find(p=>p.id===paymentId);
+      await updateLoanPayment(paymentId,data);
+      await addCashTx({type:'SAIDA',category:'Ajuste de recebimento (edição)',amount:old.amount,date:todayISO(),description:'Ajuste — edição de pagamento — '+loanId,relatedLoanId:loanId});
+      await addCashTx({type:'ENTRADA',category:'Recebimento de empréstimo',amount:data.amount,date:data.date,description:'Recebimento (editado) — '+loanId,relatedLoanId:loanId});
+      toast('Pagamento atualizado.');
+    } else {
+      await addLoanPayment(Object.assign({loanId,contactId:l.contactId},data));
+      await addCashTx({type:'ENTRADA',category:'Recebimento de empréstimo',amount:data.amount,date:data.date,description:'Recebimento de empréstimo — '+loanId,relatedLoanId:loanId});
+      toast('Pagamento registrado.');
+    }
+    closeModal(); await reloadData(); renderApp();
+  }catch(e){ toast('Erro: '+e.message,'error'); }
+}
+async function handleDeleteLoanPayment(paymentId,loanId){
+  const ok=await confirmDialog('Excluir pagamento','Deseja realmente excluir este pagamento? O saldo do empréstimo será recalculado.'); if(!ok) return;
+  const p=DATA.loanPayments.find(x=>x.id===paymentId);
+  await deleteLoanPayment(paymentId);
+  await addCashTx({type:'SAIDA',category:'Estorno de pagamento',amount:p.amount,date:todayISO(),description:'Estorno — exclusão de pagamento — '+loanId,relatedLoanId:loanId});
+  await reloadData(); renderApp(); toast('Pagamento excluído.');
+}
+
+/* =====================================================================
    CONTATOS
 ===================================================================== */
 var CT_SEARCH='';
@@ -785,14 +1016,25 @@ function pageContactDetail(id){
   const totalRecebido=DATA.receipts.filter(r=>r.contactId===id&&r.status==='ATIVO').reduce((a,r)=>a+r.amount,0);
   const saldo=ops.reduce((a,o)=>a+(o.status!=='CANCELADA'?o.outstandingBalance:0),0);
   const rows=ops.map(o=>'<div class="ledger-row" onclick="go(\'#/operacoes/'+o.id+'\')" style="cursor:pointer;"><div class="lr-main"><div class="lr-name">'+(o.itemDescription||TYPE_META[o.type].label)+'</div><div class="lr-sub">'+typeBadge(o.type)+badge(o.status)+'</div></div><div class="lr-right"><div class="lr-amt">'+money(o.outstandingBalance)+'</div></div></div>').join('');
+  const loans=loansOfContact(id);
+  const loanEmprestado=loans.reduce((a,l)=>a+l.principalAmount,0);
+  const loanContratado=loans.reduce((a,l)=>a+l.totalAmount,0);
+  const loanRecebido=loans.reduce((a,l)=>a+l.totalReceived,0);
+  const loanAberto=loans.reduce((a,l)=>a+l.outstandingBalance,0);
+  const loanRows=loans.map(l=>'<div class="ledger-row" onclick="go(\'#/emprestimos/'+l.id+'\')" style="cursor:pointer;"><div class="lr-main"><div class="lr-name">Empréstimo · juros '+l.interestRate+'%</div><div class="lr-sub">'+badge(l.status)+'</div></div><div class="lr-right"><div class="lr-amt">'+money(l.outstandingBalance)+'</div></div></div>').join('');
   return '<div class="topbar"><button class="backbtn" onclick="go(\'#/contatos\')">'+ic('back')+' Contatos</button></div>'
   +'<div class="page-pad">'
   +'<div style="display:flex;align-items:center;gap:12px;margin:6px 0 14px;"><div class="avatar" style="width:48px;height:48px;font-size:16px;">'+initials(c.name)+'</div><div><h1 style="font-family:var(--font-display);font-size:19px;">'+escapeHtml(c.name)+'</h1><div style="color:var(--ink-dim);font-size:12.5px;">'+escapeHtml(c.phone||'Sem telefone')+'</div></div></div>'
   +'<div class="kpi-mini"><div class="kpi-box"><div class="klabel">Investido</div><div class="kval">'+money(totalInvestido)+'</div></div><div class="kpi-box"><div class="klabel">Recebido</div><div class="kval" style="color:var(--sage);">'+money(totalRecebido)+'</div></div></div>'
-  +'<div class="kpi-mini"><div class="kpi-box" style="grid-column:1/-1;"><div class="klabel">Saldo em aberto</div><div class="kval">'+money(saldo)+'</div></div></div>'
+  +'<div class="kpi-mini"><div class="kpi-box" style="grid-column:1/-1;"><div class="klabel">Saldo em aberto (operações)</div><div class="kval">'+money(saldo)+'</div></div></div>'
   +'<div style="display:flex;gap:10px;margin-bottom:16px;"><button class="btn" style="flex:1;" onclick="openContactModal(\''+id+'\')">'+ic('edit')+' Editar</button><button class="btn primary" style="flex:1;" onclick="openOperationModal(null,\''+id+'\')">'+ic('plus')+' Operação</button></div>'
   +'<div class="section-head"><h3>Operações ('+ops.length+')</h3></div>'
-  +(ops.length? '<div class="ledger" style="margin-bottom:14px;">'+rows+'</div>':'<div class="empty">Nenhuma operação ainda.</div>')
+  +(ops.length? '<div class="ledger" style="margin-bottom:20px;">'+rows+'</div>':'<div class="empty" style="padding:20px;">Nenhuma operação ainda.</div>')
+  +(loans.length? '<div class="kpi-mini"><div class="kpi-box"><div class="klabel">💰 Total emprestado</div><div class="kval">'+money(loanEmprestado)+'</div></div><div class="kpi-box"><div class="klabel">Total contratado</div><div class="kval">'+money(loanContratado)+'</div></div></div>'
+    +'<div class="kpi-mini"><div class="kpi-box"><div class="klabel">Recebido</div><div class="kval" style="color:var(--sage);">'+money(loanRecebido)+'</div></div><div class="kpi-box"><div class="klabel">Em aberto</div><div class="kval">'+money(loanAberto)+'</div></div></div>':'')
+  +'<div class="section-head"><h3>💰 Empréstimos ('+loans.length+')</h3></div>'
+  +(loans.length? '<div class="ledger" style="margin-bottom:16px;">'+loanRows+'</div>':'<div class="empty" style="padding:20px;">Nenhum empréstimo ainda.</div>')
+  +'<button class="btn" style="margin-bottom:16px;width:100%;" onclick="openLoanModal(null,\''+id+'\')">'+ic('plus')+' Novo empréstimo</button>'
   +'<button class="btn danger block" onclick="handleDeleteContact(\''+id+'\')">Excluir contato</button>'
   +'</div>';
 }
@@ -802,6 +1044,7 @@ function pageContactDetail(id){
 ===================================================================== */
 function pageMais(){
   const items=[
+    ['#/emprestimos','Empréstimos','money','Dinheiro emprestado com juros, sem parcelas fixas'],
     ['#/contatos','Contatos','users','Cadastro de clientes e fornecedores'],
     ['#/relatorios','Relatórios','chart','Exportar dados em CSV'],
     ['#/backup','Backup','backup','Exportar, importar e limpar dados'],
@@ -814,6 +1057,8 @@ function pageMais(){
 function pageRelatorios(){
   return '<div class="topbar"><button class="backbtn" onclick="go(\'#/mais\')">'+ic('back')+' Mais</button></div>'
   +'<div class="page-pad"><h1 style="font-family:var(--font-display);font-size:19px;margin-bottom:14px;">Relatórios</h1>'
+  +reportRow('Empréstimos','Todos os empréstimos com valores, juros e status.','exportLoansCSV')
+  +reportRow('Pagamentos de empréstimos','Histórico de recebimentos de empréstimos.','exportLoanPaymentsCSV')
   +reportRow('Operações','Todas as operações com valores e status.','exportOperationsCSV')
   +reportRow('Recebimentos','Histórico de recebimentos registrados.','exportReceiptsCSV')
   +reportRow('Caixa','Todas as movimentações de entrada e saída.','exportCashCSV')
@@ -821,6 +1066,12 @@ function pageRelatorios(){
   +'</div>';
 }
 function reportRow(title,desc,fn){ return '<div class="ledger" style="margin-bottom:12px;"><div class="ledger-row"><div class="lr-main"><div class="lr-name">'+title+'</div><div class="lr-sub">'+desc+'</div></div><button class="btn sm" onclick="'+fn+'()">Exportar</button></div></div>'; }
+function exportLoansCSV(){ const rows=[['ID','Cliente','ValorEmprestado','Juros(%)','JurosValor','TotalContratado','Recebido','Saldo','Status','Data']];
+  DATA.loans.forEach(l=>{ const c=contactById(l.contactId); rows.push([l.id,c?c.name:'',l.principalAmount,l.interestRate,l.interestAmount,l.totalAmount,l.totalReceived,l.outstandingBalance,l.status,l.loanDate]); });
+  downloadFile('emprestimos-'+todayISO()+'.csv',toCSV(rows),'text/csv'); }
+function exportLoanPaymentsCSV(){ const rows=[['Data','Cliente','Emprestimo','Valor','Forma','Observacao']];
+  DATA.loanPayments.filter(p=>p.status==='ATIVO').forEach(p=>{ const c=contactById(p.contactId); rows.push([p.date,c?c.name:'',p.loanId,p.amount,p.method,p.notes||'']); });
+  downloadFile('pagamentos-emprestimos-'+todayISO()+'.csv',toCSV(rows),'text/csv'); }
 function exportOperationsCSV(){ const rows=[['ID','Tipo','Contraparte','Investido','A receber','Recebido','Saldo','Status']];
   DATA.operations.forEach(o=>{ const c=contactById(o.contactId); rows.push([o.id,TYPE_META[o.type].label,c?c.name:'',o.investedAmount,o.receivableAmount,o.totalReceived,o.outstandingBalance,o.status]); });
   downloadFile('operacoes-'+todayISO()+'.csv',toCSV(rows),'text/csv'); }
@@ -877,6 +1128,24 @@ async function loadDemoData(){
     if(mod===0){ for(const inst of insts) await payDemo(inst,inst.amount,contactId,op.id,type); }
     else if(mod===1){ for(let idx=0;idx<Math.floor(insts.length/2);idx++) await payDemo(insts[idx],insts[idx].amount,contactId,op.id,type); }
     else if(mod===2 && insts[0]){ await payDemo(insts[0],Math.round(insts[0].amount*0.4*100)/100,contactId,op.id,type); }
+  }
+
+  // empréstimos de exemplo (aberto, parcial, quitado)
+  const loanSeeds=[
+    {contactId:contactIds[0],principalAmount:1000,interestRate:30,daysAgo:20,payments:[]},
+    {contactId:contactIds[1],principalAmount:1500,interestRate:25,daysAgo:35,payments:[{amount:600,daysAgo:10}]},
+    {contactId:contactIds[2],principalAmount:800,interestRate:20,daysAgo:50,payments:[{amount:400,daysAgo:30},{amount:560,daysAgo:5}]},
+    {contactId:contactIds[3],principalAmount:2000,interestRate:15,daysAgo:15,payments:[]},
+  ];
+  for(const seed of loanSeeds){
+    const loanDate=addDaysISO(todayISO(),-seed.daysAgo);
+    const loan=await addLoan({contactId:seed.contactId,principalAmount:seed.principalAmount,interestRate:seed.interestRate,loanDate,notes:'Demonstração'});
+    await addCashTx({type:'SAIDA',category:'Empréstimo concedido',amount:seed.principalAmount,date:loanDate,description:'Empréstimo concedido (demo) — '+loan.id,relatedLoanId:loan.id});
+    for(const pay of seed.payments){
+      const payDate=addDaysISO(todayISO(),-pay.daysAgo);
+      await addLoanPayment({loanId:loan.id,contactId:seed.contactId,amount:pay.amount,date:payDate,method:['PIX','Transferência','Dinheiro'][Math.floor(Math.random()*3)],notes:'',status:'ATIVO'});
+      await addCashTx({type:'ENTRADA',category:'Recebimento de empréstimo',amount:pay.amount,date:payDate,description:'Recebimento de empréstimo (demo) — '+loan.id,relatedLoanId:loan.id});
+    }
   }
 }
 async function payDemo(inst,amount,contactId,operationId,type){
